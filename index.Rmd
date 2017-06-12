@@ -1,0 +1,284 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Maaike Miedema"
+date: "June 12, 2017"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+### GENERAL CHUNK SETTINGS ### 
+knitr::opts_chunk$set(echo=FALSE, results= "hold", message=FALSE, warning=FALSE, cache=TRUE)
+
+```
+
+# Summary
+This analysis is part of the Coursera Datascience Course Practical Machine Learning. In this analysis physical exercise sensor data is used to predict the way the exercise is executed. Two prediction models are fit: a Random Forest and  a K-Nearest Neighbours. Both models show an accuracy over 98% on the test set. The Random Forest Model has a 0.5% higher accuracy, but this comes at a cost: fitting the model is time consuming.
+
+# Introduction
+Two datasets are provided: a large data set to fit a prediction model on and a small quiz data set without outcomes.    
+
+The idea is to fit a model on the training set, assess it's accuracy using cross validation and apply the model to a self defined test set and finally predict the outcomes on the quiz test set. Choice of model and prediction parameters is free. Out of curiousity I've applied Random Forest as well as a K-Nearest Neighbour routine.
+
+Outline of the analysis
+
+- Explore data
+- Predictor variable selection
+- Split the data in a set for training and testing.
+- Fit and select prediction model on training set and estimate accuracy using cross validation
+- Apply prediction model to test set and check accuracy.
+- Apply prediction model to quiz data set.
+
+Note: all R-Code is given in Appendix A. 
+
+# 1. Data
+
+## 1.1 About the Data
+Source: http://groupware.les.inf.puc-rio.br/har
+
+Six young healthy participants were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions:
+
+A. exactly according to the specification
+B. throwing the elbows to the front 
+C. lifting the dumbbell only halfway 
+D. lowering the dumbbell only halfway 
+E. throwing the hips to the front 
+
+The movements of forearm, arm, dumbbell and belt were registered by sensors.  
+
+## 1.2 Raw Data
+
+```{r load_data}
+### LOAD DATA ###
+# assumed data is available in working directory
+allData<-read.csv("pml-training.csv")
+quizData<-read.csv("pml-testing.csv")
+
+```
+```{r libraries}
+### LIBRARIES ###
+
+library(dplyr)
+library(caret)
+library(randomForest)
+library(kknn)
+library(reshape2)
+
+```
+
+The complete data set consists of 19622 observations of 160 variables, one of which is classe, the way the exercise was performed. A look at the first observations in the dataset learns that there are
+many NAs and empty observations. Also from variable names like max_jaw_belt, kurtosis_pitch_belt, var_accel_arm I assume already some analysis on the data has been performed. The occurence of empty observations and NA's seems to be related to those, see the variable output in the Appendix B.
+
+```{r dimension, echo=TRUE}
+### DATA CLEANING ###
+dim(allData)
+```
+```{r all_variables, results="hide"}
+ls.str(allData)
+
+```
+
+## 1.3 Variable Selection
+
+The following predictor variables are excluded from the analysis: 
+
+1. columns 1 to 7. Reasons:
+
+  - X denotes row number and has no predictive value.
+  - user_name: when the model is used for prediction, it will be applied to other 
+    people than the participants of the study. So I don't want to include the participant as a predictor.
+  - time related variables: I won't forecast movements in future. Time is implicitly available in measurements on movement, like accelleration. 
+2. variables used in former analyses: amplitude, average, variance, standard deviation, skewness, kurtosis, min, max.
+
+This leaves us with a reduced dataset of 53 variables, including the response variable "classe". 
+All predictor variables are of class numeric or integer. 
+
+```{r clean_data}
+# Variable Selection
+cleanData <- allData[,-(1:7)]
+cleanData <- select(cleanData, 
+                    -starts_with("amplitude"), -starts_with("avg"), -starts_with("kurtosis"),
+                    -starts_with("max"), -starts_with("min"), -starts_with("skewness"),
+                    -starts_with("stddev"), -starts_with("var")
+                    )
+quizData <- quizData[,-(1:7)]
+quizData <- select(quizData, 
+                   -starts_with("amplitude"), -starts_with("avg"), -starts_with("kurtosis"),
+                   -starts_with("max"), -starts_with("min"), -starts_with("skewness"),
+                   -starts_with("stddev"), -starts_with("var")
+                   )
+names(cleanData)
+```
+There will be no problems with NAs:
+
+```{r check_NAs, echo=TRUE} 
+anyNA(cleanData)
+
+```
+
+## 1.4 Split Data in Testing and Training Set
+
+As the number of observations is large the data is split into a training set(70%): "training", 13737 observations, 
+and a test set(30%): "testing", 5885 observations. The test set is used to check the performance of the model, 
+the training set is used for model fit.
+
+```{r split_and_scale}
+
+### SPLIT DATA IN TESTING AND TRAINING ###
+set.seed(20800)
+inTrain <- createDataPartition(y=cleanData$classe, p=0.7, list=FALSE)
+training <- cleanData[inTrain,]
+testing <- cleanData[-inTrain,]
+
+# KNN uses distance as selection criterium: training and testing data are scaled and centered
+SC <- preProcess(training[,-53], method=c("center", "scale"))
+trainingSC <- predict(SC, training[,-53])
+testingSC <- predict(SC, testing[,-53])
+quizDataSC <- predict(SC,quizData[,-53])
+
+```
+Note: The data are sorted by the outcome "classe"
+```{r check_sorted, echo=TRUE}
+# check on sorted data
+sum(sort(training$classe)!=training$classe)
+
+```
+
+## 1.5 Correlation
+Below the variable combinations (row, col) are given, having a absolute correlation >0.8.
+```{r correlation}
+### CORRELATION ###
+corMatrix <- cor(training[,-53])
+corMatrix[row(corMatrix) >= col(corMatrix)] <- 0
+highCor<-abs(corMatrix) > 0.8
+index <- which(highCor, arr.ind=TRUE) #indices in corMatrix with correlation>0.8, or <0.8
+rownames(index)<-NULL
+arrange(as.data.frame(index), row)
+
+```
+The correlation between some variables certainly is not surprising: for example the total acceleration of the belt (4) is correlated with the acceleration of the belt in z direction (10).
+
+# 2. Model Fit
+
+## 2.1 Choice of Model Type
+Classe is a factor variable so a classification method  will be used for prediction. The condition of independence of predictors for Naive Bayes is not met. I've chosen to fit a K-Nearest Neighbours and a Random Forest model. To prevent overfitting both models are selected using a 10 fold cross validation. Within the model fitting procedure different values for mtry (Random Forest) and k (knn) are compared. The model with the highest accuracy is selected. The best model fits were obtained with k=1 and mtry=15.
+
+```{r model_settings}
+### MODEL FITTING - SETTINGS ###
+# General training settings: 10- fold cross validation for model fit
+controlFit <- trainControl(method="cv", number=10, returnResamp = "all") 
+# Random Forest
+mtry <- c(2,8,15,26,52)
+tuneMtry <- as.data.frame(mtry)
+nrMtry <- length(tuneMtry$mtry)
+# K-Nearest Neighbour
+k <- c(1,3,5,7,11)
+tuneK <- as.data.frame(k)
+nrK <- length(tuneK$k)
+
+```
+
+## 2.2 Results Random Forest
+As can be seen from plotted results below the Random Forest model with mtry=15 performs best. It has a very high estimated accuracy of 99.4%. The calculation is rather time consuming. The Variable Importance Plot shows the contribution of variables to the generated trees.
+
+```{r Random_forest}
+### MODEL FITTING - RANDOM FOREST ###
+set.seed(10617)
+mRfFits <- train(training[,-53], training$classe, method= "rf",
+                 trControl=controlFit, tuneGrid = tuneMtry, tuneLength = nrMtry)
+mRf <- mRfFits$finalModel
+#output
+print("RESULTS MODEL FITTING RANDOM FOREST")
+mRfFits$results
+print("TIMES FTTING RANDOM FOREST")
+mRfFits$times
+varImpPlot(mRf, main="Variance Importance (RF)")
+
+```
+## 2.3 Results K-Nearest Neigbours
+The results below show that the K-Nearest Neighbour model with k=1 performs best. It has a very high estimated accuracy of 98.8%.
+
+```{r KNN}
+### MODEL FITTING - KNN ###
+set.seed(10617)
+mKnnFits <- train(trainingSC, training$classe, method= "knn",
+                  trControl=controlFit, tuneGrid=tuneK, tuneLength=nrK)
+mKnn <- mKnnFits$finalModel
+#output
+print("RESULTS MODEL FITTING KNN")
+mKnnFits$results
+print("TIMES FTTING KNN")
+mKnnFits$times
+
+```
+## 2.4 The Methods Compared
+Both the Random Forests as as the K-Nearest Neighbours perform very well. The performance of the Random Forest model is best.The spread in estimated for accuracy and kappa is smaller for Random Forests.
+
+```{r plots}
+### COMPARE MODELS ###
+resamps <- resamples(list(KNN = mKnnFits,
+                           RF = mRfFits))
+bwplot(resamps, layout = c(2, 1), main="Performance of Random Forest vs K-Nearest Neigbour ")
+
+```
+
+# 3. Prediction Results
+The Random Forest model and knn both perform very well on the test data as well. 
+The accuracy for Random Forest is 99.3% and for the K-Nearest Neighbours is 98.8%. Both about the same as estimated during model selection. They perform alike on the quiz data set. 
+
+### Random Forest on Test Set
+```{r test_performance_Rf}
+### PERFORMANCE RANDOM FOREST ###
+confusionMatrix(testing$classe, predict(mRf,newdata=testing[,-53]))
+
+```
+
+### K-Nearest Neighbours on Test Set
+
+```{r test_performance_knn}
+### PERFORMANCE KNN ###
+# prediction values need some transformation 
+# from matrix to vector format in order to call confusionMatrix() 
+predictRaw <- predict(mKnn, newdata=testingSC) # returns a matrix object
+predictKnn <- mutate(as.data.frame(predictRaw), rowNr=row(predictRaw)[,1])# add column with original row number 
+predictKnn <- melt(predictKnn, id="rowNr")
+predictKnn <- filter(predictKnn, value==1)
+predictKnn <- arrange(predictKnn, rowNr) # to get original roworder back
+predictKnn <- predictKnn$variable # values A..E
+confusionMatrix(testing$classe, predictKnn)
+
+```
+
+### Quiz Results
+Both models predict the same outcomes for the quiz data set.
+ 
+```{r quizresults}
+### QUIZ RESULTS ###
+print("Random Forest")
+predict(mRf,newdata=quizData[,-53])
+print("K-Nearest Neighbours")
+t(predict(mKnn,newdata=quizDataSC))
+
+```
+
+# 4. Conclusion
+
+The accuracy of both models is very high, above 98 %. They predict te same outcomes on te quiz data set. The Random Forests perform slightly better than the K-Nearest Neigbours. Fitting the Random Forest is time consuming compared to the K-Nearest Neigbours model. In my case: about half an hour versus a minute. For that reason I would prefer the K-Nearest Neigbours, however, I like the variable importance plot that can be generated with Random Forests. 
+
+# 5. Useful Links
+
+- Description of the original project: http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf and
+http://groupware.les.inf.puc-rio.br/har#ixzz4jXJ35yUv
+- Information on the caret package, with nice examples: 
+https://topepo.github.io/caret/index.html
+- For help on programming issues: https://stackoverflow.com/
+
+# Appendix A - Code
+
+```{r, all-code, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+# Appendix B - Structure of Raw Data
+
+```{r, raw_data,  ref.label="all_variables", echo=TRUE, eval=TRUE}
+```
+
